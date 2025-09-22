@@ -49,6 +49,7 @@ struct SimulatorConfig {
     max_connections: usize,
     max_steps: usize,
     cosmic_ray_probability: f64,
+    disk_fault_probability: f64,
 }
 
 #[derive(Debug)]
@@ -117,10 +118,15 @@ fn main() -> anyhow::Result<()> {
 
     let fault_config = IOFaultConfig {
         cosmic_ray_probability: config.cosmic_ray_probability,
+        disk_fault_probability: config.disk_fault_probability,
     };
 
     if config.cosmic_ray_probability > 0.0 {
         println!("cosmic ray probability = {}", config.cosmic_ray_probability);
+    }
+
+    if config.disk_fault_probability > 0.0 {
+        println!("disk fault probability = {}", config.disk_fault_probability);
     }
 
     let simulator_io = Arc::new(SimulatorIO::new(args.keep, io_rng, fault_config));
@@ -260,16 +266,19 @@ fn gen_config(rng: &mut ChaCha8Rng, mode: &str) -> anyhow::Result<SimulatorConfi
             max_connections: rng.random_range(1..=8) as usize,
             max_steps: 100000,
             cosmic_ray_probability: 0.0,
+            disk_fault_probability: 0.0,
         }),
         "chaos" => Ok(SimulatorConfig {
             max_connections: rng.random_range(1..=8) as usize,
             max_steps: 10000000,
             cosmic_ray_probability: 0.0,
+            disk_fault_probability: 0.0,
         }),
         "ragnarök" | "ragnarok" => Ok(SimulatorConfig {
             max_connections: rng.random_range(1..=8) as usize,
             max_steps: 1000000,
             cosmic_ray_probability: 0.0001,
+            disk_fault_probability: 0.0001,
         }),
         _ => Err(anyhow::anyhow!("Unknown mode: {}", mode)),
     }

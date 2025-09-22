@@ -1,7 +1,11 @@
 use memmap2::{MmapMut, MmapOptions};
-use rand::{Rng, RngCore};
+use rand::{
+    Rng, RngCore,
+    distr::{Distribution, StandardUniform},
+};
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::debug;
@@ -11,21 +15,52 @@ use turso_core::{Clock, Completion, File, IO, Instant, OpenFlags, Result};
 pub struct IOFaultConfig {
     /// Probability of a cosmic ray bit flip on write (0.0-1.0)
     pub cosmic_ray_probability: f64,
+    /// Probability of disk fault event occuring (0.0-1.0)
+    pub disk_fault_probability: f64,
 }
 
 impl Default for IOFaultConfig {
     fn default() -> Self {
         Self {
             cosmic_ray_probability: 0.0,
+            disk_fault_probability: 0.0,
         }
+    }
+}
+
+/// Fault condition to apply at next simulator step
+#[derive(Debug, PartialEq)]
+enum DiskFault {
+    /// All disk operations succeed normally
+    None,
+    /// Writes to disk fail, e.g. because the disk is full
+    WriteZero,
+    /// Writes to disk partially complete
+    ShortWrite,
+}
+
+impl Distribution<DiskFault> for StandardUniform {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> DiskFault {
+        match rng.random_range(1..=2) {
+            // Only generate faults!
+            1 => DiskFault::WriteZero,
+            _ => DiskFault::ShortWrite,
+        }
+    }
+}
+
+impl fmt::Display for DiskFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
     }
 }
 
 pub struct SimulatorIO {
     files: Mutex<Vec<(String, Weak<SimulatorFile>)>>,
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
+    disk_fault: Arc<Mutex<DiskFault>>,
     keep_files: bool,
-    rng: Mutex<ChaCha8Rng>,
+    rng: Arc<Mutex<ChaCha8Rng>>,
     fault_config: IOFaultConfig,
 }
 
@@ -35,8 +70,9 @@ impl SimulatorIO {
         Self {
             files: Mutex::new(Vec::new()),
             file_sizes: Arc::new(Mutex::new(HashMap::new())),
+            disk_fault: Arc::new(Mutex::new(DiskFault::None)),
             keep_files,
-            rng: Mutex::new(rng),
+            rng: Arc::new(Mutex::new(rng)),
             fault_config,
         }
     }
@@ -74,7 +110,12 @@ impl Clock for SimulatorIO {
 
 impl IO for SimulatorIO {
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
-        let file = Arc::new(SimulatorFile::new(path, self.file_sizes.clone()));
+        let file = Arc::new(SimulatorFile::new(
+            path,
+            self.file_sizes.clone(),
+            self.disk_fault.clone(),
+            self.rng.clone(),
+        ));
 
         // Store weak reference to avoid keeping files open forever
         let mut files = self.files.lock().unwrap();
@@ -130,6 +171,16 @@ impl IO for SimulatorIO {
                 }
             }
         }
+        if self.fault_config.disk_fault_probability > 0.0 {
+            let mut rng = self.rng.lock().unwrap();
+            if rng.random::<f64>() < self.fault_config.disk_fault_probability {
+                let mut fault = self.disk_fault.lock().unwrap();
+                if *fault == DiskFault::None {
+                    *fault = rng.random::<DiskFault>();
+                    println!("Disk fault! {} will occur on next relevant IO", *fault)
+                }
+            }
+        }
         Ok(())
     }
 
@@ -151,12 +202,19 @@ struct SimulatorFile {
     mmap: Mutex<MmapMut>,
     size: Mutex<usize>,
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
+    disk_fault: Arc<Mutex<DiskFault>>,
+    rng: Arc<Mutex<ChaCha8Rng>>,
     path: String,
     _file: StdFile,
 }
 
 impl SimulatorFile {
-    fn new(file_path: &str, file_sizes: Arc<Mutex<HashMap<String, u64>>>) -> Self {
+    fn new(
+        file_path: &str,
+        file_sizes: Arc<Mutex<HashMap<String, u64>>>,
+        disk_fault: Arc<Mutex<DiskFault>>,
+        rng: Arc<Mutex<ChaCha8Rng>>,
+    ) -> Self {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -184,6 +242,8 @@ impl SimulatorFile {
             mmap: Mutex::new(mmap),
             size: Mutex::new(0),
             file_sizes,
+            disk_fault,
+            rng: rng.clone(),
             path: file_path.to_string(),
             _file: file,
         }
@@ -220,24 +280,54 @@ impl File for SimulatorFile {
         buffer: Arc<turso_core::Buffer>,
         c: Completion,
     ) -> Result<Completion> {
-        let pos = pos as usize;
-        let len = buffer.len();
+        let mut disk_fault = self.disk_fault.lock().unwrap();
+        match *disk_fault {
+            DiskFault::None => {
+                let pos = pos as usize;
+                let len = buffer.len();
 
-        if pos + len <= MAX_FILE_SIZE {
-            let mut mmap = self.mmap.lock().unwrap();
-            mmap[pos..pos + len].copy_from_slice(buffer.as_slice());
-            let mut size = self.size.lock().unwrap();
-            if pos + len > *size {
-                *size = pos + len;
-                {
-                    let mut sizes = self.file_sizes.lock().unwrap();
-                    sizes.insert(self.path.clone(), *size as u64);
+                if pos + len <= MAX_FILE_SIZE {
+                    let mut mmap = self.mmap.lock().unwrap();
+                    mmap[pos..pos + len].copy_from_slice(buffer.as_slice());
+                    let mut size = self.size.lock().unwrap();
+                    if pos + len > *size {
+                        *size = pos + len;
+                        {
+                            let mut sizes = self.file_sizes.lock().unwrap();
+                            sizes.insert(self.path.clone(), *size as u64);
+                        }
+                    }
+                    c.complete(len as i32);
+                } else {
+                    c.complete(0);
                 }
             }
-            c.complete(len as i32);
-        } else {
-            c.complete(0);
+            DiskFault::ShortWrite => {
+                let pos = pos as usize;
+                let mut rng = self.rng.lock().unwrap();
+                let short_len = rng.random_range(..buffer.len());
+
+                if pos + short_len <= MAX_FILE_SIZE {
+                    let mut mmap = self.mmap.lock().unwrap();
+                    mmap[pos..pos + short_len].copy_from_slice(buffer.as_slice());
+                    let mut size = self.size.lock().unwrap();
+                    if pos + short_len > *size {
+                        *size = pos + short_len;
+                        {
+                            let mut sizes = self.file_sizes.lock().unwrap();
+                            sizes.insert(self.path.clone(), *size as u64);
+                        }
+                    }
+                    c.complete(short_len as i32);
+                } else {
+                    c.complete(0);
+                }
+            }
+            DiskFault::WriteZero => {
+                c.complete(0);
+            }
         }
+        *disk_fault = DiskFault::None;
         Ok(c)
     }
 
@@ -247,37 +337,88 @@ impl File for SimulatorFile {
         buffers: Vec<Arc<turso_core::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
-        let mut offset = pos as usize;
-        let mut total_written = 0;
+        let mut disk_fault = self.disk_fault.lock().unwrap();
+        match *disk_fault {
+            DiskFault::None => {
+                let mut offset = pos as usize;
+                let mut total_written = 0;
 
-        {
-            let mut mmap = self.mmap.lock().unwrap();
-            for buffer in buffers {
-                let len = buffer.len();
-                if offset + len <= MAX_FILE_SIZE {
-                    mmap[offset..offset + len].copy_from_slice(buffer.as_slice());
-                    offset += len;
-                    total_written += len;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Update the file size if we wrote beyond the current size
-        if total_written > 0 {
-            let mut size = self.size.lock().unwrap();
-            let end_pos = (pos as usize) + total_written;
-            if end_pos > *size {
-                *size = end_pos;
                 {
-                    let mut sizes = self.file_sizes.lock().unwrap();
-                    sizes.insert(self.path.clone(), *size as u64);
+                    let mut mmap = self.mmap.lock().unwrap();
+                    for buffer in buffers {
+                        let len = buffer.len();
+                        if offset + len <= MAX_FILE_SIZE {
+                            mmap[offset..offset + len].copy_from_slice(buffer.as_slice());
+                            offset += len;
+                            total_written += len;
+                        } else {
+                            break;
+                        }
+                    }
                 }
+
+                // Update the file size if we wrote beyond the current size
+                if total_written > 0 {
+                    let mut size = self.size.lock().unwrap();
+                    let end_pos = (pos as usize) + total_written;
+                    if end_pos > *size {
+                        *size = end_pos;
+                        {
+                            let mut sizes = self.file_sizes.lock().unwrap();
+                            sizes.insert(self.path.clone(), *size as u64);
+                        }
+                    }
+                }
+
+                c.complete(total_written as i32);
+            }
+            DiskFault::ShortWrite => {
+                let mut offset = pos as usize;
+                let mut total_written = 0;
+
+                let mut rng = self.rng.lock().unwrap();
+                let partial_idx = rng.random_range(..buffers.len());
+
+                {
+                    let mut mmap = self.mmap.lock().unwrap();
+                    for (idx, buffer) in buffers.into_iter().enumerate() {
+                        let len = if idx < partial_idx {
+                            buffer.len()
+                        } else if idx == partial_idx {
+                            rng.random_range(..buffer.len())
+                        } else {
+                            break;
+                        };
+                        if offset + len <= MAX_FILE_SIZE {
+                            mmap[offset..offset + len].copy_from_slice(buffer.as_slice());
+                            offset += len;
+                            total_written += len;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // Update the file size if we wrote beyond the current size
+                if total_written > 0 {
+                    let mut size = self.size.lock().unwrap();
+                    let end_pos = (pos as usize) + total_written;
+                    if end_pos > *size {
+                        *size = end_pos;
+                        {
+                            let mut sizes = self.file_sizes.lock().unwrap();
+                            sizes.insert(self.path.clone(), *size as u64);
+                        }
+                    }
+                }
+
+                c.complete(total_written as i32);
+            }
+            DiskFault::WriteZero => {
+                c.complete(0);
             }
         }
-
-        c.complete(total_written as i32);
+        *disk_fault = DiskFault::None;
         Ok(c)
     }
 
